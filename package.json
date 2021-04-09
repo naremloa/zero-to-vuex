@@ -1,0 +1,20 @@
+{
+  "name": "root",
+  "private": true,
+  "devDependencies": {
+    "@babel/eslint-parser": "^7.13.14",
+    "@typescript-eslint/eslint-plugin": "^4.21.0",
+    "@typescript-eslint/parser": "^4.21.0",
+    "eslint": "^7.23.0",
+    "eslint-config-airbnb-base": "^14.2.1",
+    "eslint-config-airbnb-typescript": "^12.3.1",
+    "eslint-plugin-import": "^2.22.1",
+    "lerna": "^3.22.1"
+  },
+  "scripts": {
+    "start": "yarn workspace @zero-to-vuex/dev start"
+  },
+  "workspaces": [
+    "packages/*"
+  ]
+}
