@@ -1,1 +1,11 @@
-console.warn("Hello World! Let's start from scratch");
+import { Store, install } from './store';
+
+export default {
+  Store,
+  install,
+};
+
+export {
+  Store,
+  install,
+};
