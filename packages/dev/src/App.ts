@@ -1,4 +1,5 @@
 import Vue, { VNode } from 'vue';
+import Button from './Button';
 
 const Component = Vue.extend({
   data() {
@@ -20,6 +21,9 @@ const Component = Vue.extend({
     count(): number {
       return this.$store?.state?.count;
     },
+    formatCount(): string {
+      return this.$store?.getters.formatCount;
+    },
   },
   render(h): VNode {
     return h(
@@ -28,31 +32,15 @@ const Component = Vue.extend({
         h(
           'div',
           [
-            h(
-              'button',
-              {
-                on: {
-                  click: () => {
-                    this.$store.commit('increment', 2);
-                  },
-                },
-              },
-              '增加',
-            ),
-            h(
-              'button',
-              {
-                on: {
-                  click: () => {
-                    this.$store.commit('decrement', 2);
-                  },
-                },
-              },
-              '減少',
-            ),
+            h(Button, { on: { click: () => { this.$store.commit('increment', 2); } } }, '增加'),
+            h(Button, { on: { click: () => { this.$store.commit('decrement', 2); } } }, '減少'),
+            h(Button, { on: { click: () => { this.$store.dispatch('incrementAsync', 2); } } }, '過2秒後自增'),
           ],
         ),
-        `${this.count}`,
+        [
+          h('div', `state: ${this.count}`),
+          h('div', `getters: ${this.formatCount}`),
+        ],
       ],
     );
   },
