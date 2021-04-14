@@ -7,6 +7,7 @@ import {
   forEachValue,
 } from './utils';
 import applyMixin from './mixin';
+import ModuleCollection from './module/module-collection';
 
 let Vue;
 
@@ -26,10 +27,10 @@ export function install(_Vue) {
  *   1. 綁定 this
  *   2. 先塞入一些參數
  */
-function registerMutation(store, type, handler) {
+function registerMutation(store, type, handler, local) {
   const entry = store._mutations[type] || (store._mutations[type] = []);
   entry.push((payload) => {
-    handler.call(store, store.state, payload);
+    handler.call(store, local.state, payload);
   });
 }
 
@@ -41,14 +42,14 @@ function registerMutation(store, type, handler) {
  *   2. 先塞入一些參數
  *   3. 對非 Promise 的 handler 包一層 Promise
  */
-function registerAction(store, type, handler) {
+function registerAction(store, type, handler, local) {
   const entry = store._actions[type] || (store._actions[type] = []);
   entry.push((payload) => {
     let res = handler.call(store, {
-      dispatch: store.dispatch,
-      commit: store.commit,
-      getters: store.getters,
-      state: store.state,
+      dispatch: local.dispatch,
+      commit: local.commit,
+      getters: local.getters,
+      state: local.state,
       rootGetters: store.getters,
       rootState: store.state,
     }, payload);
@@ -66,7 +67,7 @@ function registerAction(store, type, handler) {
  * 並對 rawGetter 封裝一層次：
  *   1. 塞入參數
  */
-function registerGetter(store, type, rawGetter) {
+function registerGetter(store, type, rawGetter, local) {
   // getter 不允許註冊同名的
   if (store._wrappedGetters[type]) {
     if (__DEV__) {
@@ -76,12 +77,100 @@ function registerGetter(store, type, rawGetter) {
   }
   store._wrappedGetters[type] = function wrappedGetter() {
     return rawGetter(
-      store.state, // local state
-      store.getters, // local getters
+      local.state, // local state
+      local.getters, // local getters
       store.state, // root state
       store.getters, // root getters
     );
   };
+}
+
+function getNestedState(rootState, path) {
+  return path.reduce((state, key) => state[key], rootState);
+}
+
+/**
+ * 由於 store.getters 是同一層下進行存儲，在做 local getter 時，
+ * 要根據 namespace 篩選出相關的 getter
+ */
+function makeLocalGetters(store, namespace) {
+  if (!store._makeLocalGettersCache[namespace]) {
+    const gettersProxy = {};
+    const splitPos = namespace.length;
+    Object.keys(store.getters).forEach((type) => {
+      // skip if the target getter is not match this namespace
+      if (type.slice(0, splitPos) !== namespace) return;
+
+      // extract local getter type
+      const localType = type.slice(splitPos);
+
+      // Add a port to the getters proxy.
+      // Define as getter property because
+      // we do not want to evaluate the getters in this time.
+      Object.defineProperty(gettersProxy, localType, {
+        get: () => store.getters[type],
+        enumerable: true,
+      });
+    });
+    store._makeLocalGettersCache[namespace] = gettersProxy;
+  }
+
+  return store._makeLocalGettersCache[namespace];
+}
+
+/**
+ * 針對 namespace 生成局部的 dispatch, commit, getters 和 state
+ * 預設存在一個 root 的模塊（上下文）
+ */
+function makeLocalContext(store, namespace, path) {
+  const noNamespace = (namespace === '');
+  const local = {
+    dispatch: noNamespace
+      ? store.dispatch
+      : (_type, _payload, _options) => {
+        const args = unifyObjectStyle(_type, _payload, _options);
+        const { payload, options } = args;
+        let { type } = args;
+        if (!options || !options.root) {
+          type = namespace + type;
+          if (__DEV__ && !store._actions[type]) {
+            console.error(`[vuex] unknown local action type: ${args.type}, global type: ${type}`);
+            return;
+          }
+        }
+        store.dispatch(type, payload);
+      },
+
+    commit: noNamespace
+      ? store.commit
+      : (_type, _payload, _options) => {
+        const args = unifyObjectStyle(_type, _payload, _options);
+        const { payload, options } = args;
+        let { type } = args;
+
+        if (!options || !options.root) {
+          type = namespace + type;
+          if (__DEV__ && !store._mutations[type]) {
+            console.error(`[vuex] unknown local mutation type: ${args.type}, global type: ${type}`);
+            return;
+          }
+        }
+
+        store.commit(type, payload, options);
+      },
+  };
+
+  Object.defineProperties(local, {
+    getters: {
+      get: noNamespace
+        ? () => store.getters
+        : () => makeLocalGetters(store, namespace),
+    },
+    state: {
+      get: () => getNestedState(store.state, path),
+    },
+  });
+  return local;
 }
 
 /**
@@ -89,7 +178,10 @@ function registerGetter(store, type, rawGetter) {
  * state 和 getter 分別對應 Vue 實體的 data 和 computed
  */
 function resetStoreVM(store, state) {
+  // 清除所有 getter
   store.getters = {};
+  // 清除 local getter 的緩存
+  store._makeLocalGettersCache = Object.create(null);
   const wrappedGetters = store._wrappedGetters;
   const computed = {};
   forEachValue(wrappedGetters, (fn, key) => {
@@ -118,36 +210,75 @@ function resetStoreVM(store, state) {
 /**
  * 將使用者傳遞過來的 options 內容，一一掛載到對應的變數中
  */
-function installStore(store, state, options) {
-  const {
-    mutations: mutationsOpt,
-    actions: actionsOpt,
-    getters: gettersOpt,
-  } = options;
+function installModule(store, rootState, path, module) {
+  const isRoot = !path.length;
+  const namespace = store._modules.getNamespace(path);
+
+  // 在 _modulesNamespaceMap 中留下 namespace 紀錄
+  if (module.namespaced) {
+    if (store._modulesNamespaceMap[namespace] && __DEV__) {
+      console.error(`[vuex] duplicate namespace ${namespace} for the namespaced module ${path.join('/')}`);
+    }
+    store._modulesNamespaceMap[namespace] = module;
+  }
+
+  // 動態註冊子模塊的 state 到原本的 rootState 上
+  if (!isRoot) {
+    const parentState = getNestedState(rootState, path.slice(0, -1));
+    const moduleName = path[path.length - 1];
+    store._withCommit(() => {
+      if (__DEV__) {
+        if (moduleName in parentState) {
+          console.warn(
+            `[vuex] state field "${moduleName}" was overridden by a module with the same name at "${path.join('.')}"`,
+          );
+        }
+      }
+      Vue.set(parentState, moduleName, module.state);
+    });
+  }
+
+  const local = module.context = makeLocalContext(store, namespace, path);
 
   // 遍歷 mutations 並一一註冊到 _mutations 上
-  if (mutationsOpt) {
-    forEachValue(
-      mutationsOpt,
-      (fn, key) => { registerMutation(store, key, fn); },
-    );
-  }
+  module.forEachMutation((mutation, key) => {
+    const namespacedType = namespace + key;
+    registerMutation(store, namespacedType, mutation, local);
+  });
 
-  // 遍歷 actions 並一一註冊到 _actions 上
-  if (actionsOpt) {
-    forEachValue(
-      actionsOpt,
-      (fn, key) => { registerAction(store, key, fn); },
-    );
-  }
+  /**
+   * 遍歷 actions 並一一註冊到 _actions 上
+   * 支持在帶 namespace 的模塊註冊全域 action
+   * {
+   *   modules: {
+   *     foo: {
+   *       namespaced: true,
+   *       actions: {
+   *         someAction: {
+   *           root: true,
+   *           handler(namespacedContext, payload) { ... }
+   *         }
+   *       }
+   *     }
+   *   }
+   * }
+   */
+  module.forEachAction((action, key) => {
+    const type = action.root ? key : namespace + key;
+    const handler = action.handler || action;
+    registerAction(store, type, handler, local);
+  });
 
   // 遍歷 getters 並一一註冊到 _wrappedGetters 上
-  if (gettersOpt) {
-    forEachValue(
-      gettersOpt,
-      (fn, key) => { registerGetter(store, key, fn); },
-    );
-  }
+  module.forEachGetter((getter, key) => {
+    const namespacedType = namespace + key;
+    registerGetter(store, namespacedType, getter, local);
+  });
+
+  // 遍歷子模塊，一一註冊 options 的相關內容
+  module.forEachChild((child, key) => {
+    installModule(store, rootState, path.concat(key), child);
+  });
 }
 
 export class Store {
@@ -165,8 +296,6 @@ export class Store {
     }
 
     // 內部變數
-    // TODO: 暫存變數，存儲使用者傳遞過來的設置
-    this._options = options;
     // 判斷當前是否有 commit 正在執行
     this._committing = false;
     // 存儲 mutations 的地方
@@ -175,10 +304,12 @@ export class Store {
     this._actions = Object.create(null);
     // 存儲 getters 的地方
     this._wrappedGetters = Object.create(null);
-
-    const {
-      state: stateOpt,
-    } = options;
+    // 存儲根模塊的地方
+    this._modules = new ModuleCollection(options);
+    // namespace 的註冊紀錄，防止同路徑的模塊被加入
+    this._modulesNamespaceMap = Object.create(null);
+    // 對同一個 namespace 底下的 local getters 的緩存
+    this._makeLocalGettersCache = Object.create(null);
 
     const store = this;
     const { commit, dispatch } = this;
@@ -190,10 +321,10 @@ export class Store {
       return dispatch.call(store, type, payload);
     };
 
-    const state = (typeof stateOpt === 'function' ? stateOpt() : stateOpt) || {};
+    const { state } = this._modules.root;
 
     // 註冊各部分內容 actions, getters, mutations 等
-    installStore(this, state, options);
+    installModule(this, state, [], this._modules.root);
 
     // 生成 store 本體
     resetStoreVM(this, state);
